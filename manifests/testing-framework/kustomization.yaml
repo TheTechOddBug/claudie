@@ -33,10 +33,12 @@ secretGenerator:
 - files:
   - test-sets/rolling-update/1.yaml
   - test-sets/rolling-update/2.yaml
+  - test-sets/rolling-update/templates.yaml
   name: rolling-update
 - files:
   - test-sets/rolling-update-2/1.yaml
   - test-sets/rolling-update-2/2.yaml
+  - test-sets/rolling-update-2/templates.yaml
   name: rolling-update-2
 - files:
   - test-sets/autoscaling-1/1.yaml
@@ -46,6 +48,7 @@ secretGenerator:
 - files:
   - test-sets/autoscaling-2/1.yaml
   - test-sets/autoscaling-2/2.yaml
+  - test-sets/autoscaling-2/templates.yaml
   name: autoscaling-2
 - files:
   - test-sets/proxy-with-hetzner/1.yaml
@@ -89,4 +92,4 @@ secretGenerator:
 
 images:
 - name: ghcr.io/berops/claudie/testing-framework
-  newTag: ec973a0-4318
+  newTag: b4c932d-4362

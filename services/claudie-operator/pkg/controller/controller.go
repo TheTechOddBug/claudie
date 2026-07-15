@@ -2,6 +2,7 @@ package controller
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"fmt"
 	"strings"
@@ -16,10 +17,22 @@ import (
 	crlog "sigs.k8s.io/controller-runtime/pkg/log"
 
 	v1beta1manifest "github.com/berops/claudie/internal/api/crd/inputmanifest/v1beta1"
-	"github.com/berops/claudie/internal/api/manifest"
+	"github.com/berops/claudie/internal/api/crd/template-git-reference/v1beta1"
+	"github.com/berops/claudie/internal/envs"
 	"github.com/berops/claudie/internal/hash"
 	"github.com/berops/claudie/proto/pb/spec"
 	managerclient "github.com/berops/claudie/services/manager/client"
+)
+
+const (
+	// Claudie always comes with a default templates reference created with this name.
+	DefaultTemplatesReferenceName = "claudie-default-templates"
+)
+
+var (
+	TemplateReferenceHttpsUrl = envs.GetOrDefault("CLAUDIE_TEMPLATES_REFERENCE_HTTPS_URL", "github.com/berops/claudie-config")
+	TemplateReferenceCommit   = envs.GetOrDefault("CLAUDIE_TEMPLATES_REFERENCE_COMMIT", "release")
+	TemplatesDefaultNamespace = cmp.Or(envs.Namespace, "claudie")
 )
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -27,66 +40,155 @@ import (
 func (r *InputManifestReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := crlog.FromContext(ctx)
 
+	if err := r.ensureDefaultTemplateReference(ctx); err != nil {
+		log.Error(err, "failed to ensure default templates reference exists")
+	}
+
 	inputManifest := &v1beta1manifest.InputManifest{}
 	if err := r.kc.Get(ctx, req.NamespacedName, inputManifest); err != nil {
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// Prepare the manifest.Manifest type
-	// Refresh the inputManifest object Secret Reference
-	providersSecrets := make([]v1beta1manifest.ProviderWithData, 0, len(inputManifest.Spec.Providers))
-
-	var missingSecrets []string
+	// Fetch all related InputManifest references.
+	var (
+		providers            = make([]v1beta1manifest.ProviderWithData, 0, len(inputManifest.Spec.Providers))
+		missingSecrets       []string
+		missingTemplates     []string
+		missingTemplatesAuth []string
+	)
 
 	for _, p := range inputManifest.Spec.Providers {
 		pwd := v1beta1manifest.ProviderWithData{
 			ProviderName: p.ProviderName,
 			ProviderType: p.ProviderType,
-			Templates:    p.Templates,
 		}
 
-		key := client.ObjectKey{
+		secretKey := client.ObjectKey{
 			Name:      p.SecretRef.Name,
 			Namespace: p.SecretRef.Namespace,
 		}
 
-		if err := r.kc.Get(ctx, key, &pwd.Secret); err != nil {
-			if apierrors.IsNotFound(err) {
-				missingSecrets = append(missingSecrets, fmt.Sprintf("Provider: %s Secret: %s Namespace: %s", p.ProviderName, p.SecretRef.Name, p.SecretRef.Namespace))
-			} else {
-				// Uknown fatal error.
+		if err := r.kc.Get(ctx, secretKey, &pwd.ProviderSecret); err != nil {
+			if !apierrors.IsNotFound(err) {
 				return ctrl.Result{}, err
 			}
+
+			missingSecrets = append(
+				missingSecrets,
+				fmt.Sprintf("Provider: %q Type: %q Secret Name: %q Secret Namespace: %q",
+					p.ProviderName,
+					p.ProviderType,
+					secretKey.Name,
+					secretKey.Namespace,
+				),
+			)
+
+			// fallthrough, to check the presence of the templates.
 		}
 
-		providersSecrets = append(providersSecrets, pwd)
+		templatesKey := client.ObjectKey{
+			Name:      p.TemplatesRef.Name,
+			Namespace: p.TemplatesRef.Namespace,
+		}
+
+		if templatesKey.Name == "" {
+			templatesKey.Name = DefaultTemplatesReferenceName
+		}
+		if templatesKey.Namespace == "" {
+			templatesKey.Namespace = TemplatesDefaultNamespace
+		}
+
+		if err := r.kc.Get(ctx, templatesKey, &pwd.Templates); err != nil {
+			if !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, err
+			}
+
+			missingTemplates = append(
+				missingTemplates,
+				fmt.Sprintf("Provider: %q Type: %q Templates Name: %q Templates Namespace: %q",
+					p.ProviderName,
+					p.ProviderType,
+					templatesKey.Name,
+					templatesKey.Namespace,
+				),
+			)
+
+			// Without templates, no checking of the Auth token needs to be done.
+			continue
+		}
+
+		if pwd.Templates.Spec.Auth.SecretRef != nil {
+			secretKey = client.ObjectKey{
+				Name:      pwd.Templates.Spec.Auth.SecretRef.Name,
+				Namespace: pwd.Templates.Spec.Auth.SecretRef.Namespace,
+			}
+
+			var auth corev1.Secret
+			if err := r.kc.Get(ctx, secretKey, &auth); err != nil {
+				if !apierrors.IsNotFound(err) {
+					return ctrl.Result{}, err
+				}
+
+				missingTemplatesAuth = append(
+					missingTemplatesAuth,
+					fmt.Sprintf(
+						"Provider: %q Type: %q Templates Name: %q Templates Namespace: %q, Auth Secret Name: %q  Auth Secret Namespace: %q",
+						p.ProviderName,
+						p.ProviderType,
+						p.TemplatesRef.Name,
+						p.TemplatesRef.Namespace,
+						secretKey.Name,
+						secretKey.Namespace,
+					),
+				)
+			}
+			pwd.TemplatesAuth = &auth
+		}
+
+		providers = append(providers, pwd)
 	}
 
-	if len(missingSecrets) > 0 {
-		msg := fmt.Sprintf("the following secrets referenced inside providers were not found: %v", strings.Join(missingSecrets, ", "))
+	for _, c := range []struct {
+		items  []string
+		msgFmt string
+		reason string
+		action string
+	}{
+		{
+			items:  missingSecrets,
+			msgFmt: "The following referenced providers credentials secrets were not found:\n%v",
+			reason: "SecretNotFound",
+			action: "FetchingSecrets",
+		},
+		{
+			items:  missingTemplates,
+			msgFmt: "The following referenced provider templates were not found:\n%v",
+			reason: "TemplatesNotFound",
+			action: "FetchingTemplates",
+		},
+		{
+			items:  missingTemplatesAuth,
+			msgFmt: "The following auth secrets within referenced templates were not found:\n%v",
+			reason: "AuthSecretNotFound",
+			action: "FetchingSecrets",
+		},
+	} {
+		if len(c.items) < 1 {
+			continue
+		}
 
-		r.Recorder.Eventf(
-			inputManifest,
-			nil,
-			corev1.EventTypeWarning,
-			"SecretNotFound",
-			"FetchingSecrets",
-			"%s",
-			msg,
-		)
-		log.Error(nil, msg, "reqeueAfter", REQUEUE_AFTER_ERROR)
+		msg := fmt.Sprintf(c.msgFmt, strings.Join(c.items, "\n"))
+		r.Recorder.Eventf(inputManifest, nil, corev1.EventTypeWarning, c.reason, c.action, "%s", msg)
+		log.Error(nil, msg, "requeueAfter", REQUEUE_AFTER_ERROR)
 
 		inputManifest.SetWatchResourceStatusWithMsg(msg)
 		if err := r.kc.Status().Update(ctx, inputManifest); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed updating status: %w", err)
 		}
-
 		return ctrl.Result{RequeueAfter: REQUEUE_AFTER_ERROR}, nil
 	}
 
-	// Approximate size of the map to 5 nodes per nodepool
 	staticNodeSecrets := make(map[string][]v1beta1manifest.StaticNodeWithData, len(inputManifest.Spec.NodePools.Static))
-	// Range over static nodepools an get secret for each static node
 	for _, s := range inputManifest.Spec.NodePools.Static {
 		nodes := make([]v1beta1manifest.StaticNodeWithData, 0, len(s.Nodes))
 		for _, n := range s.Nodes {
@@ -117,7 +219,7 @@ func (r *InputManifestReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	}
 
 	// Create a raw input manifest of manifest.Manifest and pull the referenced secrets into it
-	rawManifest, err := constructInputManifest(*inputManifest, providersSecrets, staticNodeSecrets)
+	rawManifest, err := constructInputManifest(*inputManifest, providers, staticNodeSecrets)
 	if err != nil {
 		log.Error(err, "error while using referenced secrets", "will try again in", REQUEUE_AFTER_ERROR)
 		r.Recorder.Eventf(
@@ -131,9 +233,6 @@ func (r *InputManifestReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		)
 		return ctrl.Result{RequeueAfter: REQUEUE_AFTER_ERROR}, nil
 	}
-
-	// check if templates are defined for dynamic nodepools if not use defaults
-	setDefaultTemplates(&rawManifest)
 
 	// With the rawManifest filled with providers credentials,
 	// the Manifest.Providers{} struct will be properly validated
@@ -410,24 +509,38 @@ func (r *InputManifestReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 	return ctrl.Result{RequeueAfter: REQUEUE_UPDATE}, nil
 }
 
-func setDefaultTemplates(m *manifest.Manifest) {
-	m.ForEachProvider(func(_, typ string, tmpls **manifest.TemplateRepository) bool {
-		defaultRepository(tmpls, typ)
-		return true
-	})
-}
-
-func defaultRepository(r **manifest.TemplateRepository, providerTyp string) {
-	const (
-		repo = "https://github.com/berops/claudie-config"
-		path = "templates/terraformer/"
-	)
-
-	if *r == nil {
-		*r = &manifest.TemplateRepository{
-			Repository: repo,
-			Path:       path + providerTyp,
-		}
-		return
+func (r *InputManifestReconciler) ensureDefaultTemplateReference(ctx context.Context) error {
+	desired := &v1beta1.TemplateGitReference{
+		Spec: v1beta1.TemplateGitReferenceSpec{
+			Endpoint: v1beta1.EndpointSpec{
+				URL:      TemplateReferenceHttpsUrl,
+				Protocol: "https",
+			},
+			Commit: TemplateReferenceCommit,
+			Paths: v1beta1.GitPaths{
+				Terraformer:  "templates/terraformer",
+				Playbooks:    "templates/playbooks",
+				ConfigLB:     "templates/config-lb",
+				ConfigK8s:    "templates/config-k8s",
+				ManifestsK8s: "templates/manifests-k8s",
+			},
+		},
 	}
+	desired.Name = DefaultTemplatesReferenceName
+	desired.Namespace = TemplatesDefaultNamespace
+
+	key := client.ObjectKey{
+		Name:      DefaultTemplatesReferenceName,
+		Namespace: TemplatesDefaultNamespace,
+	}
+	existing := v1beta1.TemplateGitReference{}
+	if err := r.kc.Get(ctx, key, &existing); err != nil {
+		if !apierrors.IsNotFound(err) {
+			return err
+		}
+		return r.kc.Create(ctx, desired)
+	}
+
+	existing.Spec = desired.Spec
+	return r.kc.Update(ctx, &existing)
 }
